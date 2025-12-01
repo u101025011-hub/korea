@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>濟州島旅行規劃 - 分帳版</title>
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 設置字體為 Noto Sans TC 以支援中文 -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
+        body {
+            font-family: 'Noto Sans TC', sans-serif;
+            background-color: #212121; /* 更改為「石爺爺」的深沈火山岩顏色 */
+        }
+        /* 輕微淡藍色作為卡片分類底色 */
+        .card-attraction { background-color: #e6f6ff; }
+        .card-restaurant { background-color: #fff0e6; }
+        .card-transport { background-color: #e6ffe6; }
+        .card-etc { background-color: #f3e6ff; }
+        /* 自定義滾動條 (選配，提升 App 質感) */
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #99cfff; border-radius: 2px; }
+        ::-webkit-scrollbar-track { background: #333333; } /* 配合深色背景更新軌道顏色 */
+        
+        /* 確保內容區域填滿屏幕高度 */
+        #content-container {
+            height: calc(100vh - 64px - 64px); /* 減去 header 和 tabs 的高度 */
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+    </style>
+    <!-- 配置 Tailwind CSS 使用 Inter 字体和圆角 -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary-blue': '#64b5f6',
+                        'secondary-light': '#bbdefb',
+                    },
+                }
+            }
+        }
+    </script>
+</head>
+<body class="min-h-screen">
+
+    <!-- Firebase 模組載入 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp, orderBy, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // 設定 Firebase 全域變數
+        window.appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        window.firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        window.initialAuthToken = typeof __initial_auth_token !== 'undefined' ? window.__initial_auth_token : null;
+
+        let app, db, auth;
+        
+        // 行前準備清單
+        const initialChecklist = {
+            '護照、機票、預訂確認單': false,
+            '當地貨幣 (韓元) 及海外信用卡': false,
+            '轉換插頭 (韓標) 與行動電源': false,
+            '旅遊保險單副本與緊急聯絡資訊': false,
+            '常備藥品、個人護理用品': false,
+            '防水/保暖衣物 (濟州島12月較冷)': false,
+            '國際駕照、護照、駕照原件 (租車用)': false,
+            '重要文件電子備份（雲端）': false,
+            '預載韓國地圖 App (KakaoMap/Naver Map)': false, // 新增：導航 App 提醒
+        };
+
+        window.state = {
+            userId: null,
+            isAuthReady: false,
+            activePage: 'prep', 
+            expenses: [],
+            itineraryData: null,
+            guideCache: {},
+            checklist: initialChecklist 
+        };
+
+        setLogLevel('debug'); // 開啟 Firestore 偵錯日誌
+
+        // --- Firebase 初始化與身份驗證 ---
+        const initFirebase = async () => {
+            if (Object.keys(window.firebaseConfig).length === 0) {
+                console.error("Firebase config is missing. Using mocked data for expenses.");
+                document.getElementById('auth-status').textContent = "（警告：資料庫連線失敗，無法儲存費用）";
+                document.getElementById('auth-status').classList.remove('hidden');
+                return;
+            }
+
+            try {
+                app = initializeApp(window.firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                window.db = db; // 讓主 JS 程式碼可以存取 db
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        window.state.userId = user.uid;
+                        console.log("User authenticated:", user.uid);
+                    } else {
+                        try {
+                            const anonymousUser = await signInAnonymously(auth);
+                            window.state.userId = anonymousUser.user.uid;
+                            console.log("Signed in anonymously:", window.state.userId);
+                        } catch (error) {
+                            console.error("Anonymous sign in failed:", error);
+                        }
+                    }
+                    window.state.isAuthReady = true;
+                    window.initAppAfterAuth();
+                });
+
+                if (window.initialAuthToken) {
+                    await signInWithCustomToken(auth, window.initialAuthToken);
+                }
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+            }
+        };
+
+        // 費用監聽器 (不變)
+        window.setupExpenseListener = () => {
+            const userId = window.state.userId;
+            const appId = window.appId;
+            if (!userId || !db) {
+                console.warn("Firestore not ready or user not logged in.");
+                return;
+            }
+
+            // 私人數據路徑：/artifacts/{appId}/users/{userId}/expenses
+            const expensesRef = collection(db, `artifacts/${appId}/users/${userId}/expenses`);
+            const q = query(expensesRef, orderBy('timestamp', 'desc'));
+
+            onSnapshot(q, (snapshot) => {
+                const expenses = [];
+                snapshot.forEach(doc => {
+                    expenses.push({ id: doc.id, ...doc.data() });
+                });
+                window.state.expenses = expenses;
+                // 只有在分帳頁面時才重新渲染清單和總結
+                if (window.state.activePage === 'expenses') {
+                    window.renderExpensePage();
+                }
+            }, (error) => {
+                console.error("Error listening to expenses:", error);
+            });
+        };
+
+        // 費用儲存功能 (不變)
+        window.saveExpense = async (expense) => {
+            if (!window.state.userId || !db) {
+                // 使用自訂訊息框代替 alert
+                console.error("錯誤：身份驗證未完成，無法儲存費用。");
+                return false;
+            }
+            try {
+                const expensesRef = collection(db, `artifacts/${window.appId}/users/${window.state.userId}/expenses`);
+                await addDoc(expensesRef, {
+                    ...expense,
+                    timestamp: serverTimestamp() // 使用伺服器時間戳
+                });
+                return true;
+            } catch (error) {
+                console.error("Error adding document:", error);
+                // 使用自訂訊息框代替 alert
+                return false;
+            }
+        };
+
+        // 費用刪除功能 (不變)
+        window.deleteExpense = async (id) => {
+            if (!window.state.userId || !db) {
+                // 使用自訂訊息框代替 alert
+                console.error("錯誤：身份驗證未完成，無法刪除費用。");
+                return;
+            }
+            try {
+                const docRef = doc(db, `artifacts/${window.appId}/users/${window.state.userId}/expenses`, id);
+                await deleteDoc(docRef);
+            } catch (error) {
+                console.error("Error deleting document:", error);
+                // 使用自訂訊息框代替 alert
+            }
+        };
+
+        initFirebase();
+    </script>
+
+
+    <!-- 主要應用程式介面 -->
+    <div id="app" class="flex flex-col h-screen max-w-lg mx-auto bg-white shadow-xl">
+
+        <!-- Header: 標題 (已還原為飛機圖示) -->
+        <header class="bg-primary-blue text-white shadow-md p-4 flex justify-between items-center sticky top-0 z-20">
+            <h1 class="text-xl font-bold">
+                <!-- 飛機 Emoji (已還原) -->
+                <span class="text-xl mr-2">✈️</span>
+                <span style="font-size: 1.5rem; font-weight: 700;">濟州島旅行</span>
+            </h1>
+            <div id="user-id-display" class="text-xs bg-white text-primary-blue px-2 py-1 rounded-full opacity-80">
+                使用者ID: 載入中...
+            </div>
+        </header>
+
+        <!-- 身份驗證狀態顯示 (除錯用) -->
+        <div id="auth-status" class="text-xs text-center p-1 bg-yellow-100 text-yellow-800 hidden">Loading...</div>
+
+        <!-- Tab Bar for Days and Expenses -->
+        <nav class="bg-white shadow-inner flex justify-around p-2 sticky top-16 z-10" id="day-tabs">
+            <!-- Tabs will be rendered here by JS -->
+        </nav>
+
+        <!-- Main Content Area -->
+        <main id="content-container" class="p-4 space-y-4">
+            <!-- Content will be rendered here based on activePage -->
+        </main>
+
+    </div>
+
+    <script>
+        // --- 核心行程數據結構 (已全面更新，新增 Day 2 & Day 3 座標) ---
+        const itineraryData = {
+            day1: {
+                date: '12/6',
+                title: 'Day 1天 (12/6) - 西部: 看海 & 質感選物',
+                weather: { emoji: '☀️', text: '晴朗', temp: '15°C', location: '涯月/翰林' },
+                locations: [
+                    { time: '06:05', name: '濟州機場', type: '交通', category: 'transport', coords: { lat: 33.5113, lng: 126.4933 } }, 
+                    { time: '08:30', name: '星巴克 涯月店', type: '餐廳', category: 'restaurant', note: '喝限定特調', coords: { lat: 33.4682, lng: 126.3105 } },
+                    { time: '10:30', name: 'Noraba 海鮮拉麵', type: '餐廳', category: 'restaurant', note: '戶外看海吃麵', coords: { lat: 33.4735, lng: 126.3142 } },
+                    { time: '12:30', name: 'Mood & Slo-mo', type: '景點', category: 'attraction', note: '翰林質感選物店逛街', coords: { lat: 33.4110, lng: 126.3180 } },
+                    { time: '14:30', name: '挾才海水浴場', type: '景點', category: 'attraction', note: '果凍海拍照', coords: { lat: 33.3916, lng: 126.2366 } },
+                    { time: '16:00', name: 'Hello Kitty Island', type: '景點', category: 'attraction', coords: { lat: 33.3031, lng: 126.4718 } },
+                    { time: '18:30', name: '熟成到 涯月店', type: '餐廳', category: 'restaurant', note: '記得預約！', coords: { lat: 33.4682, lng: 126.3105 } },
+                    { time: '20:30', name: 'Poniente 民宿', type: '住宿', category: 'etc', note: '辦理入住手續', coords: { lat: 33.4750, lng: 126.3200 } },
+                    { time: '宵夜', name: 'Puradak 炸雞', type: '美食', category: 'restaurant', note: '必點: 紫菜海苔口味', coords: { lat: 33.4750, lng: 126.3200 } } // 新增座標
+                ]
+            },
+            day2: {
+                date: '12/7',
+                title: 'Day 2天 (12/7) - 南部&市區：室內躲雨與文創探索',
+                weather: { emoji: '🌧️', text: '預報下雨', temp: '10°C', location: '西歸浦/濟州市區' },
+                locations: [
+                    // *** 橘花閨樓：地址和備註已更新 ***
+                    { 
+                        time: '10:30', 
+                        name: '橘花閨樓', 
+                        type: '餐廳', 
+                        category: 'restaurant', 
+                        note: '超美橘子窗景咖啡。地址: 34 Ieodo-ro 1027beon-gil, Seogwipo-si, Jeju-do, 南韓', 
+                        coords: { lat: 33.2505, lng: 126.5685 }, 
+                        address: '34 Ieodo-ro 1027beon-gil, Seogwipo-si, Jeju-do, 南韓' 
+                    },
+                    { time: '12:30', name: '西歸浦每日偶來市場', type: '美食', category: 'attraction', note: '老奶奶橘子麻糬', coords: { lat: 33.2483, lng: 126.5658 } },
+                    { time: '15:00', name: '濟州市區文青散步', type: '景點', category: 'attraction', note: '包含 Classic Moongusa, The Islander, Playworks', coords: { lat: 33.5135, lng: 126.5298 } },
+                    { time: '16:30', name: 'Mochiron & Eggultart', type: '美食', category: 'restaurant', note: '達克瓦茲與草莓牛奶', coords: { lat: 33.5090, lng: 126.5310 } },
+                    { time: '18:00', name: '濟州東門市場', type: '美食', category: 'attraction', note: '夜市小吃', coords: { lat: 33.5141, lng: 126.5348 } },
+                    { time: '19:30', name: '樂天超市 濟州店', type: '購物', category: 'etc', note: '零食泡麵大補貨', coords: { lat: 33.5061, lng: 126.5283 } }
+                ]
+            },
+            day3: {
+                date: '12/8',
+                title: 'Day 3天 (12/8) - 東部: 戶外拍照日',
+                weather: { emoji: '🌤️', text: '天氣轉晴', temp: '18°C', location: '城山日出峰' },
+                locations: [
+                    // 新增座標
+                    { time: '09:00', name: 'London Bagel & 夢炭', type: '餐廳', category: 'restaurant', coords: { lat: 33.4795, lng: 126.5925 } },
+                    { time: '12:00', name: 'Dalmeunggot', type: '景點', category: 'attraction', note: '月汀里綠色屋頂小店', coords: { lat: 33.5570, lng: 126.7900 } },
+                    { time: '13:30', name: 'Snoopy Garden 스누피가든', type: '景點', category: 'attraction', note: '戶外花園拍照', coords: { lat: 33.4262, lng: 126.7844 } },
+                    { time: '16:00', name: 'Audrant Bakery', type: '美食', category: 'restaurant', note: '大蒜麵包', coords: { lat: 33.4900, lng: 126.8300 } },
+                    { time: '17:00', name: '城山日出峰', type: '景點', category: 'attraction', note: '爬山看日落', coords: { lat: 33.4628, lng: 126.9377 } },
+                    { time: '18:30', name: '三代海女之家', type: '餐廳', category: 'restaurant', note: '海鮮刀削麵', coords: { lat: 33.4735, lng: 126.9360 } }
+                ]
+            },
+            day4: {
+                date: '12/9',
+                title: 'Day 4天 (12/9) - 賦歸',
+                weather: { emoji: '🌥️', text: '多雲', temp: '13°C', location: '濟州機場' },
+                locations: [
+                    { time: '13:00', name: '濟州國際機場', type: '交通', category: 'transport', coords: { lat: 33.5113, lng: 126.4933 } }
+                ]
+            }
+        };
+        
+        // --- 全局常數 ---
+        const KRW_TO_TWD_RATE = 0.024; // 1 KRW ≈ 0.024 TWD (模擬匯率)
+        const USERS = ['Karen', 'Zuzu', 'Yuki', 'Mindy'];
+
+
+        // --- 全局狀態與初始化 ---
+        document.addEventListener('DOMContentLoaded', () => {
+            window.state.itineraryData = itineraryData;
+        });
+
+        window.initAppAfterAuth = () => {
+            document.getElementById('auth-status').classList.add('hidden');
+            document.getElementById('user-id-display').textContent = `使用者ID: ${window.state.userId.substring(0, 8)}...`;
+            renderDayTabs();
+            // 初始渲染為 'prep'
+            window.renderAppContent(window.state.activePage);
+            
+            // 費用功能啟動
+            if (window.db) {
+                window.setupExpenseListener();
+            }
+        };
+
+
+        // --- 核心 UI 渲染功能 ---
+
+        // 渲染主內容（根據當前分頁）
+        window.renderAppContent = (pageKey) => {
+            const contentContainer = document.getElementById('content-container');
+            contentContainer.scrollTop = 0; // 切換分頁時滾動到頂部
+            
+            if (pageKey === 'expenses') {
+                window.renderExpensePage();
+            } else if (pageKey === 'prep') { // 新增 行前準備 頁面渲染
+                window.renderPrepPage();
+            } else if (itineraryData[pageKey]) {
+                window.renderDailyItinerary(pageKey);
+            }
+        };
+
+        // 渲染頂部標籤
+        function renderDayTabs() {
+            const tabsContainer = document.getElementById('day-tabs');
+            tabsContainer.innerHTML = '';
+            
+            // 確保 'prep' 在行程之前
+            const pages = ['prep', ...Object.keys(itineraryData), 'expenses'];
+
+            pages.forEach(pageKey => {
+                const isExpense = pageKey === 'expenses';
+                const isPrep = pageKey === 'prep';
+                
+                let buttonText;
+                if (isPrep) {
+                    buttonText = '行前準備 📝';
+                } else if (isExpense) {
+                    buttonText = '分帳/結算 💰'; 
+                } else {
+                    buttonText = `${pageKey.charAt(0).toUpperCase() + pageKey.slice(1)}天`;
+                }
+
+                const isActive = pageKey === window.state.activePage;
+                const button = document.createElement('button');
+
+                button.textContent = buttonText;
+                button.className = `py-2 px-3 rounded-full font-medium transition-all duration-200 text-sm ${isActive ? 'bg-primary-blue text-white shadow-md' : 'text-gray-600 hover:bg-secondary-light'}`;
+                
+                button.onclick = () => {
+                    window.state.activePage = pageKey;
+                    renderDayTabs();
+                    window.renderAppContent(pageKey);
+                };
+                tabsContainer.appendChild(button);
+            });
+        }
+
+        // 渲染每日行程 (已移除區域總覽地圖)
+        window.renderDailyItinerary = (dayKey) => {
+            const dayData = itineraryData[dayKey];
+            const contentContainer = document.getElementById('content-container');
+            contentContainer.innerHTML = '';
+            
+            // 1. 每日天氣/標題卡片
+            contentContainer.innerHTML += createWeatherCard(dayData);
+            
+            // 2. 行程卡片
+            dayData.locations.forEach((location, index) => {
+                contentContainer.innerHTML += createItineraryCard(dayKey, index, location);
+            });
+        }
+
+        // --- 行前準備與注意事項 渲染 (新) ---
+
+        /**
+         * Toggles the checked status of a checklist item.
+         * 由於沒有使用 Firestore 儲存 checklist 狀態，我們直接更新 window.state
+         * @param {string} itemKey - The key (text) of the item to toggle.
+         */
+        window.toggleChecklistItem = (itemKey) => {
+            window.state.checklist[itemKey] = !window.state.checklist[itemKey];
+            if (window.state.activePage === 'prep') {
+                window.renderPrepPage(); // 重新渲染頁面以顯示更新
+            }
+        }
+
+        /**
+         * Renders the Checklist (行前準備及注意事項) page.
+         */
+        window.renderPrepPage = () => {
+            const checklist = window.state.checklist;
+            const contentContainer = document.getElementById('content-container');
+
+            let checklistHTML = '';
+            for (const [text, checked] of Object.entries(checklist)) {
+                // SVG for the checkbox icon (Lucide icons: Square and CheckSquare)
+                const iconSVG = checked
+                    ? `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-6 h-6 text-green-600 mr-3"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`
+                    : `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-6 h-6 text-gray-400 mr-3"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/></svg>`;
+
+                // 使用 window.toggleChecklistItem 確保函數可存取
+                checklistHTML += `
+                    <li onclick="window.toggleChecklistItem('${text}')" class="flex items-center p-4 mb-3 bg-white rounded-xl shadow-md cursor-pointer hover:shadow-lg transition duration-150 ease-in-out border ${checked ? 'border-green-400' : 'border-gray-200'}">
+                        ${iconSVG}
+                        <span class="text-lg font-medium ${checked ? 'line-through text-gray-500' : 'text-gray-800'}">${text}</span>
+                    </li>
+                `;
+            }
+
+            // HTML content for the entire preparation page
+            contentContainer.innerHTML = `
+                <div class="space-y-8">
+                    <h2 class="text-3xl font-extrabold text-white border-b-4 border-blue-500 pb-2">📝 行前準備及注意事項</h2>
+
+                    <!-- 行前準備 Checklist Section -->
+                    <section>
+                        <h3 class="text-2xl font-bold text-blue-400 mb-4">✅ 行前準備清單 (點擊項目進行勾選)</h3>
+                        <ul class="list-none p-0">
+                            ${checklistHTML}
+                        </ul>
+                    </section>
+
+                    <!-- 注意事項 Precautions Section -->
+                    <section>
+                        <h3 class="text-2xl font-bold text-red-400 mb-4 mt-6">⚠️ 濟州島旅遊注意事項 (12月)</h3>
+                        <div class="bg-red-50 p-6 rounded-xl shadow-inner space-y-3">
+                            <p class="text-gray-800">1. **保暖與防風:** 濟州島12月風大且海邊寒冷，務必準備厚外套、圍巾、手套和帽子，多層次穿搭。</p>
+                            <p class="text-gray-800">2. **租車駕駛:** 韓國靠右行駛，濟州島部分路段有山坡或彎道。請小心駕駛，特別留意路邊停靠的海女攤販。</p>
+                            <p class="text-gray-800">3. **餐廳預約:** 像「熟成到」這類熱門黑豬肉餐廳，強烈建議提前透過電話或韓國App（如 Catch Table）預約。</p>
+                            <p class="text-gray-800">4. **橘子採購:** 12月是橘子盛產期。在市場購買時，注意辨別品種和新鮮度，可以適度議價。</p>
+                            <p class="text-gray-800">5. **緊急聯絡:** 韓國緊急電話：警察 112，消防/救護車 119。將飯店和租車公司電話儲存。</p>
+                            <p class="text-gray-800 font-bold">6. **<span class="text-red-600">導航 App (極重要):</span>** Google Maps 在韓國無法提供可靠的駕車/大眾運輸導航。請務必<span class="underline">預先下載並熟悉</span> **KakaoMap** 或 **Naver Map**，這對您的自駕行程至關重要！</p>
+                        </div>
+                    </section>
+                </div>
+            `;
+             // 更新了標題顏色，確保在深色背景下可見
+            const prepTitles = contentContainer.querySelectorAll('h2, h3');
+            prepTitles.forEach(el => {
+                if (el.tagName === 'H2') el.classList.remove('text-gray-900');
+                if (el.tagName === 'H3' && el.classList.contains('text-blue-700')) {
+                    el.classList.remove('text-blue-700');
+                    el.classList.add('text-blue-400');
+                }
+                if (el.tagName === 'H3' && el.classList.contains('text-red-700')) {
+                    el.classList.remove('text-red-700');
+                    el.classList.add('text-red-400');
+                }
+            });
+        }
+
+
+        // --- 行程輔助渲染函數 (已更新導航按鈕) ---
+        function createWeatherCard(dayData) {
+            return `
+                <div class="bg-gradient-to-r from-primary-blue to-blue-300 text-white p-5 rounded-xl shadow-lg mb-4">
+                    <h2 class="text-2xl font-bold mb-1">${dayData.title}</h2>
+                    <p class="text-sm font-light">${dayData.weather.location} | ${dayData.weather.date}</p>
+                    <div class="flex items-center justify-between mt-3">
+                        <div class="flex items-center">
+                            <span class="text-5xl mr-3">${dayData.weather.emoji}</span>
+                            <div>
+                                <p class="text-3xl font-bold">${dayData.weather.temp}</p>
+                                <p class="text-sm">${dayData.weather.text}</p>
+                            </div>
+                        </div>
+                        <div class="text-right">
+                             <p class="text-xs font-semibold">今日導覽提醒：</p>
+                            <p class="text-sm">${dayData.weather.emoji === '🌧️' ? '建議室內行程，請攜帶雨具！' : '戶外攝影日，防曬準備！'}</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function createItineraryCard(dayKey, index, location) {
+            const categoryMap = {
+                'attraction': '景點', 'restaurant': '餐廳', 'transport': '交通', 'etc': '其他',
+                '美食': '餐廳', '咖啡廳': '餐廳', '住宿': '其他', '購物': '其他'
+            };
+            const category = location.category || location.type || 'etc';
+            const categoryLabel = categoryMap[category] || categoryMap[location.type] || '其他';
+            const bgColorClass = `card-${category}`;
+            const key = `${dayKey}-${index}`;
+            const isGuideLoaded = window.state.guideCache[key];
+
+            // KakaoMap 導航/搜索使用名稱 (在韓國最準確)
+            const encodedName = encodeURIComponent(location.name);
+            // Google Map 搜索優先使用地址 (如果存在)，否則使用名稱
+            const encodedGoogleQuery = encodeURIComponent(location.address || location.name);
+
+
+            return `
+                <div class="bg-white p-4 rounded-xl shadow-md overflow-hidden">
+                    <div class="flex items-start">
+                        <span class="text-lg font-bold text-gray-500 w-16 flex-shrink-0">${location.time}</span>
+                        <div class="flex-grow">
+                            <div class="flex justify-between items-start">
+                                <h4 class="text-lg font-semibold text-gray-800">${location.name}</h4>
+                                <span class="text-xs font-medium px-2 py-0.5 rounded-full ${bgColorClass} border border-blue-200 text-primary-blue">${categoryLabel}</span>
+                            </div>
+                            ${location.note ? `<p class="text-sm text-gray-600 mt-1">${location.note}</p>` : ''}
+                            
+                            <!-- 導遊職責/故事區塊 -->
+                            <div id="guide-${key}" class="mt-3 space-y-2">
+                                ${isGuideLoaded ? isGuideLoaded : '<div class="text-sm text-gray-500 italic">點擊下方按鈕獲取導覽資訊...</div>'}
+                            </div>
+
+                            <div class="flex space-x-2 mt-4">
+                                <!-- 導遊職責按鈕 -->
+                                <button onclick="fetchGuideDetails('${dayKey}', ${index})" 
+                                        class="flex-1 bg-secondary-light text-primary-blue text-sm font-semibold py-2 rounded-full hover:bg-blue-200 transition duration-150">
+                                    ${isGuideLoaded ? '重新分析/收起' : '導遊職責 📜'}
+                                </button>
+                                
+                                <!-- 導航/搜索按鈕組 (僅限有座標的) -->
+                                ${location.coords ? `
+                                    <!-- 1. KakaoMap 導航 (現改為名稱搜索) -->
+                                    <a href="https://map.kakao.com/link/search/${encodedName}" target="_blank"
+                                       class="flex-1 bg-yellow-500 text-gray-900 text-sm font-semibold py-2 rounded-full text-center hover:bg-yellow-600 transition duration-150 flex items-center justify-center">
+                                        <!-- Map Icon -->
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.828 0l-4.243-4.243m10.606-10.606l-4.243 4.243m0 0L9.414 7.414m-1.414 4.243l4.243 4.243m0 0L17.657 16.657m0 0L13.414 20.9m4.243-4.243a8 8 0 10-10.606 0" />
+                                        </svg>
+                                        KakaoMap 導航
+                                    </a>
+                                    <!-- 2. Google Map 搜索 (優先使用地址) -->
+                                    <a href="https://www.google.com/maps/search/?api=1&query=${encodedGoogleQuery}" target="_blank"
+                                       class="flex-1 bg-blue-100 text-primary-blue text-sm font-semibold py-2 rounded-full text-center hover:bg-blue-200 transition duration-150 flex items-center justify-center">
+                                        <!-- Search Icon (Magnifying Glass) -->
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                                        </svg>
+                                        Google Map 搜索
+                                    </a>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // --- 導遊職責 (LLM) 模擬功能 (已更新東門市場和史努比博物館的內容) ---
+        function getMockGuideContent(locationName) {
+            const nameToContent = {
+                '濟州機場': {
+                    guide: `OK 租車公司通常提供接駁服務往返機場和租車點。請在抵達機場後，根據指示前往指定接駁車乘車點。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-orange-100 text-orange-800 text-xs font-bold px-2 py-0.5 rounded-full">重要提醒</span>：取車手續需要時間，請預留充足時間。</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">必備文件</span>：國際駕照、護照、駕照原件。</li>
+                        </ul>`,
+                    key: 'OK-CarRental-2025'
+                },
+                '星巴克 涯月店': {
+                    guide: `涯月海岸線的星巴克通常擁有絕佳海景！這是開始美好一天的好地方。記得試試濟州島限定的飲品或糕點。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-green-100 text-green-800 text-xs font-bold px-2 py-0.5 rounded-full">必試</span>：濟州黑芝麻拿鐵、濟州限定蛋糕。</li>
+                            <li><span class="inline-block bg-orange-100 text-orange-800 text-xs font-bold px-2 py-0.5 rounded-full">拍照建議</span>：選擇靠窗位置，拍下海景與咖啡的合影。</li>
+                        </ul>`,
+                    key: 'Starbucks-Aewol-2025'
+                },
+                'Noraba 海鮮拉麵': {
+                    guide: `諾拉巴 (Noraba) 是一家位於海岸邊的超人氣海鮮拉麵店，以其絕佳的海景視野和新鮮海產聞名。建議在午餐時間前抵達，避開排隊人潮。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">必吃美食</span>：招牌海鮮拉麵，湯頭濃郁、海產新鮮。</li>
+                            <li><span class="inline-block bg-orange-100 text-orange-800 text-xs font-bold px-2 py-0.5 rounded-full">必點菜單</span>：除了拉麵，烤鮑魚也是熱門選項。</li>
+                        </ul>`,
+                    key: 'Noraba-Ramen-2025'
+                },
+                'Mood & Slo-mo': {
+                    guide: `這是一家充滿質感與設計感的選物店，提供濟州島藝術家創作的獨特商品和紀念品。非常適合喜歡文創和質感生活用品的您。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-purple-100 text-purple-800 text-xs font-bold px-2 py-0.5 rounded-full">必逛</span>：濟州島特色香氛、手工飾品、設計文具。</li>
+                            <li><span class="inline-block bg-green-100 text-green-800 text-xs font-bold px-2 py-0.5 rounded-full">購物建議</span>：在這裡可以找到別處沒有的獨特伴手禮。</li>
+                        </ul>`,
+                    key: 'Mood-Slo-mo-2025'
+                },
+                '挾才海水浴場': {
+                    guide: `挾才海水浴場因其清澈見底、宛如果凍般的海水而聞名，對面就是飛揚島 (Biyangdo)。它被認為是濟州島最美的海灘之一，非常適合拍照。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-purple-100 text-purple-800 text-xs font-bold px-2 py-0.5 rounded-full">必拍角度</span>：以飛揚島為背景，拍攝透明海水的層次感。</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">必備物品</span>：防曬霜、太陽眼鏡，以及一條美麗的絲巾。</li>
+                        </ul>`,
+                    key: 'Hyeopjae-Beach-Guide-2025'
+                },
+                'Hello Kitty Island': {
+                    guide: `Hello Kitty Island 是全球唯一以 Hello Kitty 為主題的博物館。這裡有豐富的展覽、拍照區和周邊商品店，非常適合童心未泯的您。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-pink-100 text-pink-800 text-xs font-bold px-2 py-0.5 rounded-full">少女心爆發</span>：各個主題房和夢幻佈景都是拍照打卡點！</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">限定商品</span>：記得在禮品店尋找濟州島限定的 Hello Kitty 商品。</li>
+                        </ul>`,
+                    key: 'HK-Island-2025'
+                },
+                '熟成到 涯月店': {
+                    guide: `熟成到 (Sukseongdo) 是濟州島知名的黑豬肉餐廳，主打濕式熟成的頂級肉品。這裡經常客滿，強烈建議提前預約，否則可能需要等待數小時。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-orange-100 text-orange-800 text-xs font-bold px-2 py-0.5 rounded-full">必點菜單</span>：熟成黑豬肉五花肉（오겹살），油脂豐富，入口即化。</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">重要提醒</span>：這頓是晚餐，請確保在預約時間內抵達！</li>
+                        </ul>`,
+                    key: 'Sukseongdo-Aewol-2025'
+                },
+                'Poniente 民宿': {
+                    guide: `Poniente 位於涯月，是一個非常舒適的住宿選擇。請注意，入住時間為晚上 20:30。建議在用餐後再前往辦理入住手續，以免耽誤時間。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-blue-100 text-blue-800 text-xs font-bold px-2 py-0.5 rounded-full">重要提醒</span>：晚間入住請提前與民宿主人確認 Check-in 方式。</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">民宿地址</span>：請準備好民宿的確切地址用於導航。</li>
+                        </ul>`,
+                    key: 'Poniente-Checkin-2025'
+                },
+                '西歸浦每日偶來市場': {
+                    guide: `西歸浦偶來市場是一個充滿活力的傳統市場，不僅是當地居民的廚房，也是遊客體驗濟州美食的好去處。這裡有許多販售橘子和橘子加工品的攤位。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">必吃美食</span>：炸雞塊串、黑豬肉可樂餅、老奶奶橘子麻糬。</li>
+                            <li><span class="inline-block bg-yellow-100 text-yellow-800 text-xs font-bold px-2 py-0.5 rounded-full">必買伴手禮</span>：當季濟州橘子、橘子巧克力、市場自製的橘子醬。</li>
+                        </ul>`,
+                    key: 'Seogwipo-Market-2025'
+                },
+                '城山日出峰': {
+                    guide: `城山日出峰 (Seongsan Ilchulbong) 是一座巨大的火山口，被聯合國教科文組織列為世界自然遺產。從山頂俯瞰的景色壯麗無比，特別是日出或日落時分。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-green-100 text-green-800 text-xs font-bold px-2 py-0.5 rounded-full">重要提醒</span>：上山來回約需1小時，請穿著舒適的鞋子，並計算好日落時間。</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">日落時間</span>：今日預計約 17:15 左右。</li>
+                        </ul>`,
+                    key: 'Seongsan-Ilchulbong-2025'
+                },
+                '橘花閨樓': {
+                    guide: `橘花閨樓是一家以濟州橘子為主題的咖啡廳，以絕美的窗景聞名，非常適合拍照。特別是在下雨天，室內氛圍更加溫馨舒適。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-orange-100 text-orange-800 text-xs font-bold px-2 py-0.5 rounded-full">必點</span>：橘子系列飲品、橘子塔或蛋糕。</li>
+                            <li><span class="inline-block bg-purple-100 text-purple-800 text-xs font-bold px-2 py-0.5 rounded-full">必拍角度</span>：坐在窗邊，以橘子園或海景為背景拍攝。</li>
+                        </ul>`,
+                    key: 'Tangerine-Cafe-2025'
+                },
+                // --- 更新：濟州東門市場 ---
+                '濟州東門市場': {
+                    guide: `濟州東門市場是濟州市最大的傳統市場之一，夜市部分非常熱鬧，尤其以海鮮和街頭小吃聞名。晚上來這裡可以大飽口福。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">夜市必吃</span>：黑豬肉串、新鮮生魚片、烤海鮮、各種韓式街頭小吃。</li>
+                            <li><span class="inline-block bg-yellow-100 text-yellow-800 text-xs font-bold px-2 py-0.5 rounded-full">建議</span>：市場內有很多橘子、漢拏峰柑橘等，適合購買當季水果。</li>
+                        </ul>`,
+                    key: 'Dongmun-Market-2025'
+                },
+                'London Bagel & 夢炭': {
+                    guide: `這是濟州島知名的早午餐攻略組合。London Bagel 提供各種美味的貝果；夢炭則是另一家受歡迎的早午餐點，可能需要排隊。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-orange-100 text-orange-800 text-xs font-bold px-2 py-0.5 rounded-full">重要提醒</span>：請提前規劃排隊或等待時間，建議在營業前抵達。</li>
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">必點</span>：貝果搭配濃郁奶油乳酪！</li>
+                        </ul>`,
+                    key: 'Brunch-2025'
+                },
+                // --- 更新：Snoopy Garden ---
+                'Snoopy Garden 스누피가든': {
+                    guide: `Snoopy Garden (史努比花園) 戶外花園佔地廣大，完美呈現了《花生漫畫》中的各種場景。無論室內室外，都是史努比粉絲必訪之地。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-green-100 text-green-800 text-xs font-bold px-2 py-0.5 rounded-full">必拍角度</span>：戶外花園裡的各種史努比裝置藝術，建議預留充足時間在戶外。</li>
+                            <li><span class="inline-block bg-blue-100 text-blue-800 text-xs font-bold px-2 py-0.5 rounded-full">建議</span>：參觀結束後，別忘了去咖啡廳購買聯名咖啡和紀念品。</li>
+                        </ul>`,
+                    key: 'Snoopy-Garden-2025'
+                },
+                'Puradak 炸雞': {
+                    guide: `Puradak 炸雞是韓國知名的連鎖炸雞店，以其特別的烤箱烘烤後再油炸的方式，提供外酥內嫩的口感。
+                        <p class="mt-2 text-sm text-gray-700">【攻略提示】</p>
+                        <ul class="list-disc list-inside space-y-1 mt-1">
+                            <li><span class="inline-block bg-red-100 text-red-800 text-xs font-bold px-2 py-0.5 rounded-full">必點</span>：紫菜海苔口味（Black Label），這是他們的招牌之一。</li>
+                            <li><span class="inline-block bg-yellow-100 text-yellow-800 text-xs font-bold px-2 py-0.5 rounded-full">建議搭配</span>：冰鎮的啤酒或可樂，享受完美的韓式宵夜。</li>
+                        </ul>`,
+                    key: 'Puradak-Chicken-2025'
+                },
+                default: {
+                    guide: `【${locationName} 導覽分析】<p class="text-xs italic mt-1 text-gray-400">（此為通用模擬內容。若有特定美食/伴手禮/代號，系統會自動亮顯）</p>，這是一個值得探索的好地方！別忘了拍照留念，並享受這難得的時光。`,
+                    key: 'Default-Guide-2025'
+                }
+            };
+            return nameToContent[locationName] || nameToContent.default;
+        }
+
+        async function fetchGuideDetails(dayKey, index) {
+            const key = `${dayKey}-${index}`;
+            const targetElement = document.getElementById(`guide-${key}`);
+            const locationName = window.state.itineraryData[dayKey].locations[index].name;
+
+            // 緩存和收起邏輯
+            if (window.state.guideCache[key]) {
+                const currentContent = window.state.guideCache[key];
+                if (targetElement.innerHTML.includes('【攻略提示】') || targetElement.innerHTML.includes('（此為通用模擬內容')) {
+                    targetElement.innerHTML = '<div class="text-sm text-gray-500 italic">點擊下方按鈕獲取導覽資訊...</div>';
+                } else {
+                    targetElement.innerHTML = currentContent;
+                }
+                // 重新渲染卡片以更新按鈕文字
+                window.renderDailyItinerary(window.state.activePage);
+                return;
+            }
+
+            // 顯示載入中
+            targetElement.innerHTML = '<div class="text-sm text-primary-blue flex items-center"><svg class="animate-spin -ml-1 mr-2 h-5 w-5 text-primary-blue" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> AI 導遊分析中...</div>';
+
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            const { guide, key: guideKey } = getMockGuideContent(locationName);
+
+            window.state.guideCache[key] = guide;
+            targetElement.innerHTML = guide;
+
+            window.renderDailyItinerary(window.state.activePage);
+        }
+
+        // --- 分帳/費用功能渲染 (不變) ---
+
+        window.renderExpensePage = () => {
+            const contentContainer = document.getElementById('content-container');
+            contentContainer.innerHTML = `
+                <div class="bg-white p-4 rounded-xl shadow-lg mb-4">
+                    <h2 class="text-2xl font-bold text-primary-blue mb-4">分帳紀錄與結算</h2>
+                    
+                    <!-- 匯率換算與新增表單 -->
+                    <form id="expense-form" class="space-y-4 border-b pb-4 mb-4">
+                        <h3 class="text-xl font-bold text-gray-800">新增費用</h3>
+
+                        <div>
+                            <label for="description" class="block text-sm font-medium text-gray-700">項目描述:</label>
+                            <input type="text" id="description" required class="mt-1 block w-full border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue p-2">
+                        </div>
+
+                        <div>
+                            <label for="payer" class="block text-sm font-medium text-gray-700">誰付的錢 (付款人):</label>
+                            <select id="payer" required class="mt-1 block w-full border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue p-2">
+                                <option value="" disabled selected>-- 請選擇人員 --</option>
+                                ${USERS.map(user => `<option value="${user}">${user}</option>`).join('')}
+                            </select>
+                        </div>
+
+                        <div>
+                            <label for="krwAmount" class="block text-sm font-medium text-gray-700">韓元金額 (KRW):</label>
+                            <input type="number" id="krwAmount" required class="mt-1 block w-full border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue p-2" min="1">
+                        </div>
+
+                        <div id="twd-conversion" class="text-lg font-semibold text-green-600 bg-green-50 p-3 rounded-lg text-center">
+                            ≈ 0 TWD (匯率: 1 KRW ≈ ${KRW_TO_TWD_RATE.toFixed(3)} TWD)
+                        </div>
+
+                        <button type="submit" class="w-full bg-primary-blue text-white py-2 rounded-lg font-semibold hover:bg-blue-600 transition duration-150">
+                            新增費用 (4人平均分攤)
+                        </button>
+                    </form>
+
+                    <!-- 分帳總結區塊 -->
+                    <div id="expense-summary" class="mb-6">
+                        <!-- Summary will be rendered here -->
+                    </div>
+
+                    <!-- 費用清單 -->
+                    <div>
+                        <h3 class="text-xl font-bold mb-3 text-gray-800">費用明細</h3>
+                        <div id="expense-list" class="space-y-2">
+                            <p class="text-center text-gray-500">載入中...</p>
+                        </div>
+                    </div>
+
+                </div>
+            `;
+
+            // 重新綁定事件
+            document.getElementById('krwAmount').addEventListener('input', updateTwdConversion);
+            document.getElementById('expense-form').addEventListener('submit', handleExpenseSubmit);
+            
+            // 渲染列表和總結
+            window.renderExpenseSummary();
+            window.renderExpenseList();
+        };
+
+        // 匯率換算即時更新 (不變)
+        function updateTwdConversion() {
+            const krw = parseFloat(document.getElementById('krwAmount').value) || 0;
+            const twd = krw * KRW_TO_TWD_RATE;
+            document.getElementById('twd-conversion').innerHTML = `
+                ≈ ${twd.toFixed(2)} TWD 
+                <span class="text-xs font-normal opacity-75">(匯率: 1 KRW ≈ ${KRW_TO_TWD_RATE.toFixed(3)} TWD)</span>
+            `;
+        }
+        
+        // 費用儲存處理 (不變)
+        async function handleExpenseSubmit(e) {
+            e.preventDefault();
+            const krwAmount = parseFloat(document.getElementById('krwAmount').value);
+            const description = document.getElementById('description').value.trim();
+            const payer = document.getElementById('payer').value;
+
+            if (!krwAmount || !description || !payer) return;
+
+            const twdAmount = krwAmount * KRW_TO_TWD_RATE;
+
+            const newExpense = {
+                krw: krwAmount,
+                twd: twdAmount,
+                description: description,
+                payer: payer, // 新增付款人
+                userId: window.state.userId,
+            };
+
+            const success = await window.saveExpense(newExpense);
+            if (success) {
+                document.getElementById('expense-form').reset();
+                document.getElementById('twd-conversion').innerHTML = `≈ 0 TWD (匯率: 1 KRW ≈ ${KRW_TO_TWD_RATE.toFixed(3)} TWD)`;
+            }
+        }
+
+        // 分帳邏輯計算 (不變)
+        function calculateSplit(expenses) {
+            if (expenses.length === 0) {
+                return { totalTWD: 0, totalKRW: 0, summary: {} };
+            }
+
+            const totalTWD = expenses.reduce((sum, exp) => sum + exp.twd, 0);
+            const sharePerPerson = totalTWD / USERS.length;
+            const summary = {};
+
+            USERS.forEach(user => {
+                const twdPaid = expenses
+                    .filter(exp => exp.payer === user)
+                    .reduce((sum, exp) => sum + exp.twd, 0);
+
+                const balance = twdPaid - sharePerPerson; // 正數：應收回 / 負數：應支付
+
+                summary[user] = {
+                    paid: twdPaid,
+                    share: sharePerPerson,
+                    balance: balance,
+                    status: balance > 0.1 ? '應收回' : (balance < -0.1 ? '應支付' : '已結清')
+                };
+            });
+
+            return {
+                totalTWD: totalTWD,
+                totalKRW: expenses.reduce((sum, exp) => sum + exp.krw, 0),
+                summary: summary,
+                sharePerPerson: sharePerPerson
+            };
+        }
+
+        // 渲染費用總結 (不變)
+        window.renderExpenseSummary = () => {
+            const summaryContainer = document.getElementById('expense-summary');
+            const { totalTWD, totalKRW, summary, sharePerPerson } = calculateSplit(window.state.expenses);
+
+            if (!summaryContainer) return;
+
+            if (window.state.expenses.length === 0) {
+                summaryContainer.innerHTML = `
+                    <h3 class="text-xl font-bold text-gray-800 mb-3">分帳總結 (4人)</h3>
+                    <div class="bg-gray-100 p-4 rounded-lg text-center text-gray-500">
+                        目前無費用紀錄，無需結算。
+                    </div>
+                `;
+                return;
+            }
+
+            let summaryHtml = `
+                <h3 class="text-xl font-bold text-gray-800 mb-3 flex justify-between items-center">
+                    分帳總結 (4人)
+                    <span class="text-sm font-normal text-primary-blue bg-blue-100 px-2 py-1 rounded-full">總支出: NT$ ${totalTWD.toFixed(0)}</span>
+                </h3>
+                <div class="bg-primary-blue text-white p-3 rounded-t-lg shadow-inner flex justify-between font-bold">
+                    <span>每人應分攤:</span>
+                    <span>NT$ ${sharePerPerson.toFixed(0)}</span>
+                </div>
+                <div class="bg-white border border-gray-200 rounded-b-lg divide-y divide-gray-100">
+            `;
+
+            USERS.forEach(user => {
+                const userSummary = summary[user];
+                const balanceClass = userSummary.balance > 0.1 ? 'text-red-500 font-bold' : (userSummary.balance < -0.1 ? 'text-green-500 font-bold' : 'text-gray-500');
+                const sign = userSummary.balance > 0.1 ? '+$' : (userSummary.balance < -0.1 ? '-$' : '±$');
+                
+                summaryHtml += `
+                    <div class="p-3 flex justify-between items-center">
+                        <div>
+                            <p class="font-semibold text-gray-800">${user}</p>
+                            <p class="text-xs text-gray-500">已付: NT$ ${userSummary.paid.toFixed(0)}</p>
+                        </div>
+                        <div class="${balanceClass} text-lg text-right">
+                            ${sign} ${Math.abs(userSummary.balance).toFixed(0)}
+                            <p class="text-xs font-normal ${balanceClass}">${userSummary.status}</p>
+                        </div>
+                    </div>
+                `;
+            });
+
+            summaryHtml += '</div>';
+            summaryContainer.innerHTML = summaryHtml;
+        };
+
+        // 渲染費用清單 (不變)
+        window.renderExpenseList = () => {
+            const list = document.getElementById('expense-list');
+            if (!list) return; // 確保在分頁上
+            
+            const expenses = window.state.expenses;
+            list.innerHTML = '';
+
+            if (expenses.length === 0) {
+                list.innerHTML = '<p class="text-center text-gray-500">目前沒有記錄任何費用。</p>';
+                return;
+            }
+
+            expenses.forEach(expense => {
+                const item = document.createElement('div');
+                item.className = 'flex justify-between items-center bg-gray-50 p-3 rounded-lg border border-gray-200';
+                item.innerHTML = `
+                    <div>
+                        <p class="font-medium text-gray-900">${expense.description}</p>
+                        <p class="text-sm text-gray-500">付款人: ${expense.payer} | ${expense.krw.toLocaleString('ko-KR')} KRW</p>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <p class="text-lg font-bold text-green-600">NT$ ${expense.twd.toFixed(0)}</p>
+                        <button onclick="window.deleteExpense('${expense.id}')" class="text-red-400 hover:text-red-600 transition duration-150">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                        </button>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+        };
+    </script>
+</body>
+</html>
